@@ -7,9 +7,16 @@ import pyautogui
 import random
 import keyboard
 import threading
+from itertools import combinations
 
 
-# === Функция для выбора области экрана ===
+# === Глобальные переменные ===
+stop_solver = False
+pause_solver = False
+
+# ==============================
+# === Выбор области экрана ====
+# ==============================
 class AreaSelectorApp:
     def __init__(self, callback, is_cell=False):
         self.root = tk.Tk()
@@ -49,81 +56,12 @@ class AreaSelectorApp:
     def run(self):
         self.root.mainloop()
 
-def highlight_board(area, cell_size):
-    # Делаем скриншот игрового поля
-    board_image = ImageGrab.grab(bbox=area)
-    board_image = board_image.convert("RGBA")  # RGBA для прозрачности
-
-    draw = ImageDraw.Draw(board_image)
-
-    # Цвета рамок
-    COLORS = {
-        'closed': (0, 0, 0),      # Чёрный
-        'flag': (255, 0, 0),      # Красный
-        '0': (255, 255, 255),     # Белый
-        '1': (255, 255, 255),
-        '2': (255, 255, 255),
-        '3': (255, 255, 255),
-        '4': (255, 255, 255),
-        '5': (255, 255, 255),
-        '6': (255, 255, 255),
-        '7': (255, 255, 255),
-        '8': (255, 255, 255),
-        '?': (255, 255, 0),       # Жёлтый для неопределённых
-    }
-
-    # Размеры доски
-    board_width = area[2] - area[0]
-    board_height = area[3] - area[1]
-
-    cols = board_width // cell_size
-    rows = board_height // cell_size
-
-    # Анализируем каждую ячейку и рисуем рамку
-    for row in range(rows):
-        for col in range(cols):
-            x1 = col * cell_size
-            y1 = row * cell_size
-            x2 = x1 + cell_size
-            y2 = y1 + cell_size
-
-            cell_img = board_image.crop((x1, y1, x2, y2))
-            cell_type = cell_color_to_type(cell_img)
-
-            color = COLORS.get(cell_type, (255, 255, 0))  # Жёлтый по умолчанию
-
-            # Рисуем рамку (толщина 2 пикселя)
-            draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
-
-    # Показываем результат поверх экрана
-    overlay_window(board_image)
-
-def overlay_window(image):
-    root = tk.Tk()
-    root.overrideredirect(True)  # Убираем заголовок окна
-    root.geometry(f"{image.width}x{image.height}+0+0")
-    root.lift()
-    root.attributes("-topmost", True)
-    root.attributes("-transparentcolor", "black")  # Черный фон станет прозрачным
-
-    # Преобразуем изображение в Tkinter PhotoImage
-    from PIL import ImageTk
-    img = ImageTk.PhotoImage(image)
-
-    # СОХРАНЯЕМ ССЫЛКУ НА ИЗОБРАЖЕНИЕ
-    root.image = img  # ← ВАЖНО!
-
-    label = tk.Label(root, image=img)
-    label.pack()
-
-    # Закрываем оверлей через 1 секунду
-    root.after(1000, root.destroy)
-
-    root.mainloop()
-
-# === Определение типа ячейки по цвету ===
+# ==============================
+# === Распознавание цветов ====
+# ==============================
 def cell_color_to_type(cell_img):
     global pause_solver
+
     img = cell_img.convert('RGB')
     img_array = np.array(img)
 
@@ -135,15 +73,15 @@ def cell_color_to_type(cell_img):
 
     CELL_COLORS = {
         '0':        (172, 171, 172),
-        'closed':   (186, 187, 189),
-        'flag':     (175, 164, 166),
+        'X':        (186, 187, 189),
+        'F':        (175, 164, 166),
         '1':        (143, 142, 187),
         '2':        (123,159, 123),
         '3':        (195, 127, 128),
         '4':        (130, 128, 162),
         '5':        (161, 124, 126),
         '6':        (0, 0, 0),
-        '7':        (133, 154, 154),
+        '7':        (0, 0, 0),
         '8':        (133, 154, 154),
     }
 
@@ -169,9 +107,9 @@ def cell_color_to_type(cell_img):
 
     return closest_type
 
-
-
-# === Анализ поля Сапёра ===
+# ==============================
+# === Работа с игровым полем ==
+# ==============================
 def analyze_board(area, cell_size):
     board_image = ImageGrab.grab(bbox=area)
     board_width = area[2] - area[0]
@@ -196,8 +134,6 @@ def analyze_board(area, cell_size):
 
     return board_state
 
-
-# === Получение соседних координат ===
 def get_neighbors(board, row, col):
     neighbors = []
     for dr in [-1, 0, 1]:
@@ -215,9 +151,9 @@ def is_game_over(board, total_mines=0):
 
     for row in board:
         for cell in row:
-            if cell == 'closed':
+            if cell == 'X':
                 closed_cells += 1
-            elif cell == 'flag':
+            elif cell == 'F':
                 flagged_cells += 1
 
     # Сценарий 1: Все ячейки открыты
@@ -232,7 +168,59 @@ def is_game_over(board, total_mines=0):
 
     return False
 
-# === Логика решения Сапёра ===
+# ==============================
+# === Логика решения игры ====
+# ==============================
+def find_mandatory_mines(board):
+    mandatory_mines = []
+    safe_cells = []
+
+    # Собираем информацию о числах и их соседях
+    number_constraints = {}
+    for row in range(len(board)):
+        for col in range(len(board[0])):
+            if board[row][col].isdigit() and board[row][col] != '0':
+                count = int(board[row][col])
+                neighbors = get_neighbors(board, row, col)
+                unknown = [n for n in neighbors if board[n[0]][n[1]] == 'X']
+                flagged = [n for n in neighbors if board[n[0]][n[1]] == 'F']
+
+                # Оставшиеся неизвестные ячейки
+                remaining_unknown = len(unknown) - len(flagged)
+
+                if remaining_unknown > 0:
+                    number_constraints[(row, col)] = {
+                        'count': count,
+                        'unknown': unknown,
+                        'flagged': flagged,
+                        'remaining': remaining_unknown
+                    }
+
+    # Проверяем пересечения между числами
+    keys = list(number_constraints.keys())
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            cell1 = keys[i]
+            cell2 = keys[j]
+
+            # Получаем данные для двух чисел
+            data1 = number_constraints[cell1]
+            data2 = number_constraints[cell2]
+
+            # Находим общие неизвестные ячейки
+            common_unknown = set(data1['unknown']) & set(data2['unknown'])
+
+            # Если количество мин совпадает с количеством общих ячеек
+            if data1['remaining'] == len(common_unknown) and data2['remaining'] == len(common_unknown):
+                mandatory_mines.extend(common_unknown)
+
+            # Если общих ячеек больше, чем нужно минам
+            elif len(common_unknown) > max(data1['remaining'], data2['remaining']):
+                # Ячейки, которые точно безопасны
+                safe_cells.extend(common_unknown)
+
+    return mandatory_mines, safe_cells
+
 def solve_minesweeper(area, cell_size=20, total_mines=10):
     global stop_solver
     global pause_solver
@@ -269,8 +257,8 @@ def solve_minesweeper(area, cell_size=20, total_mines=10):
                         count = int(cell)
                         neighbors = get_neighbors(board, row_idx, col_idx)
 
-                        unknown = [n for n in neighbors if board[n[0]][n[1]] == 'closed']
-                        flagged = [n for n in neighbors if board[n[0]][n[1]] == 'flag']
+                        unknown = [n for n in neighbors if board[n[0]][n[1]] == 'X']
+                        flagged = [n for n in neighbors if board[n[0]][n[1]] == 'F']
 
                         # Случай 1: Все флаги уже поставлены → открываем остальные
                         if count == len(flagged):
@@ -295,23 +283,29 @@ def solve_minesweeper(area, cell_size=20, total_mines=10):
                     if made_move:
                         break
 
-            # Если явных ходов нет → делаем случайный выбор
+            # === Анализ обязательных мин ===
             if not made_move:
-                print("[INFO] Нет явных ходов. Ищу закрытые ячейки для случайного открытия...")
+                mandatory_mines, safe_cells = find_mandatory_mines(board)
 
-                closed_cells = []
-                for row_idx, row in enumerate(board):
-                    for col_idx, cell in enumerate(row):
-                        if cell == 'closed':
-                            closed_cells.append((row_idx, col_idx))
+                if mandatory_mines:
+                    print("[ACTION] Найдены обязательные мины:")
+                    for r, c in mandatory_mines:
+                        print(f"Флаг на [{r}][{c}]")
+                        click(area, r, c, right_click=True, CELL_SIZE=cell_size)
+                    made_move = True
 
-                if closed_cells:
-                    safe_choice = random.choice(closed_cells)
-                    r, c = safe_choice
-                    print(f"[ACTION] Случайный выбор: открываю [{r}][{c}]")
-                    click(area, r, c, right_click=False, CELL_SIZE=cell_size)
-                else:
-                    print("[INFO] Нет закрытых ячеек. Возможно, игра завершена.")
+                elif safe_cells:
+                    print("[ACTION] Найдены безопасные ячейки:")
+                    for r, c in safe_cells:
+                        print(f"Открытие [{r}][{c}]")
+                        click(area, r, c, right_click=False, CELL_SIZE=cell_size)
+                    made_move = True
+
+            if not made_move:
+                print("[INFO] Нет явных ходов. Предоставляется выбор пользователю...")
+                pause_solver = True
+                show_uncnown_mine_dialog()
+
 
             if stop_solver:
                 print("[INFO] Прерывание по ESC.")
@@ -322,8 +316,72 @@ def solve_minesweeper(area, cell_size=20, total_mines=10):
     except KeyboardInterrupt:
         print("Решатель остановлен пользователем.")
 
+# def analyze_groups(board):
+#     rows = len(board)
+#     cols = len(board[0])
+#
+#     # Словарь для хранения информации о группах
+#     groups = {}
+#
+#     # Проходим по всем числам
+#     for row in range(rows):
+#         for col in range(cols):
+#             if board[row][col].isdigit():
+#                 count = int(board[row][col])
+#                 neighbors = get_neighbors(board, row, col)
+#
+#                 # Соседние ячейки
+#                 unknown = [n for n in neighbors if board[n[0]][n[1]] == 'X']
+#                 flagged = [n for n in neighbors if board[n[0]][n[1]] == 'F']
+#
+#                 # Если число мин уже известно
+#                 if count == len(flagged):
+#                     # Открываем все незакрытые ячейки
+#                     for r, c in unknown:
+#                         yield ('open', r, c)
+#                 elif count == len(flagged) + len(unknown):
+#                     # Ставим флаги на все незакрытые ячейки
+#                     for r, c in unknown:
+#                         yield ('flag', r, c)
+#                 else:
+#                     # Добавляем эту группу в список для дальнейшего анализа
+#                     key = (row, col)
+#                     groups[key] = {
+#                         'count': count,
+#                         'unknown': unknown,
+#                         'flagged': flagged,
+#                     }
+#
+#     # Теперь анализируем группы вместе
+#     for group_key, group_data in groups.items():
+#         count = group_data['count']
+#         unknown = group_data['unknown']
+#         flagged = group_data['flagged']
+#
+#         # Проверяем пересечения с другими группами
+#         for other_key, other_data in groups.items():
+#             if other_key != group_key:
+#                 other_count = other_data['count']
+#                 other_unknown = other_data['unknown']
+#                 other_flagged = other_data['flagged']
+#
+#                 # Найдём общих соседей
+#                 common_unknown = list(set(unknown) & set(other_unknown))
+#                 if common_unknown:
+#                     # Вычисляем, сколько мин могут быть в общих соседях
+#                     total_mines = min(count - len(flagged), other_count - len(other_flagged))
+#
+#                     # Если общие соседи меньше или равны количеству мин
+#                     if len(common_unknown) <= total_mines:
+#                         # Ставим флаги на всех общих соседях
+#                         for r, c in common_unknown:
+#                             yield ('flag', r, c)
+#                     elif len(common_unknown) == total_mines:
+#                         # Открываем все другие незакрытые ячейки
+#                         for r, c in unknown:
+#                             if (r, c) not in common_unknown:
+#                                 yield ('open', r, c)
 
-# === Совершить клик по ячейке ===
 def click(area, row, col, right_click=False, CELL_SIZE=20):
     x_center = area[0] + col * CELL_SIZE + CELL_SIZE // 2
     y_center = area[1] + row * CELL_SIZE + CELL_SIZE // 2
@@ -341,30 +399,17 @@ def click(area, row, col, right_click=False, CELL_SIZE=20):
 
     print(f"[DEBUG] {'Правый' if right_click else 'Левый'} клик по [{row}][{col}]")
 
-# === Вывод среднего цвета ячейки ===
-def analyze_cell_color(area, *args):
-    screenshot = ImageGrab.grab(bbox=area)
-    cell_img = screenshot.crop((0, 0, area[2]-area[0], area[3]-area[1]))
-    img = cell_img.convert('RGB')
-    img_array = np.array(img)
+# ==============================
+# === Диалоги и взаимодействие
+# ==============================
+def select_cell_area():
+    print("Выберите ячейку...")
+    AreaSelectorApp(analyze_cell_color, is_cell=True).run()
 
-    h, w, _ = img_array.shape
-    pad_w, pad_h = w // 10, h // 10
-    center = img_array[pad_h:h - pad_h, pad_w:w - pad_w]
+def select_game_area():
+    print("Выберите область игрового поля...")
+    AreaSelectorApp(start_game).run()
 
-    avg_color = np.mean(center, axis=(0, 1)).astype(int)  # RGB
-    print(f"[Цвет ячейки] RGB{tuple(avg_color)}")
-    update_gui_color(avg_color)
-
-
-# === Обновление цвета в интерфейсе ===
-def update_gui_color(rgb):
-    hex_color = '#%02x%02x%02x' % tuple(rgb)
-    color_label.config(bg=hex_color)
-    color_value.config(text=f"RGB{tuple(rgb)}")
-
-
-# === Начать игру (выбрать область поля и запустить решатель) ===
 def start_game(area, *args):
     try:
         print("Область выбрана для игры:", area)
@@ -389,23 +434,26 @@ def start_game(area, *args):
     except ValueError:
         print("Ошибка ввода. Пожалуйста, введите корректные значения.")
 
+def analyze_cell_color(area, *args):
+    screenshot = ImageGrab.grab(bbox=area)
+    cell_img = screenshot.crop((0, 0, area[2]-area[0], area[3]-area[1]))
+    img = cell_img.convert('RGB')
+    img_array = np.array(img)
 
-# === Выбор области ячейки ===
-def select_cell_area():
-    print("Выберите ячейку...")
-    AreaSelectorApp(analyze_cell_color, is_cell=True).run()
+    h, w, _ = img_array.shape
+    pad_w, pad_h = w // 10, h // 10
+    center = img_array[pad_h:h - pad_h, pad_w:w - pad_w]
+
+    avg_color = np.mean(center, axis=(0, 1)).astype(int)  # RGB
+    print(f"[Цвет ячейки] RGB{tuple(avg_color)}")
+    update_gui_color(avg_color)
 
 
-# === Выбор области игрового поля ===
-def select_game_area():
-    print("Выберите область игрового поля...")
-    AreaSelectorApp(start_game).run()
-
-def listen_for_escape():
-    global stop_solver
-    keyboard.wait('esc')
-    stop_solver = True
-    print("\n[INFO] Нажата клавиша ESC. Завершение работы...")
+# === Обновление цвета в интерфейсе ===
+def update_gui_color(rgb):
+    hex_color = '#%02x%02x%02x' % tuple(rgb)
+    color_label.config(bg=hex_color)
+    color_value.config(text=f"RGB{tuple(rgb)}")
 
 def show_unknown_color_dialog(rgb_color):
     dialog = tk.Toplevel(root)
@@ -431,45 +479,88 @@ def show_unknown_color_dialog(rgb_color):
 
     root.wait_window(dialog)
 
-stop_solver = False
-pause_solver = False
-# === GUI приложение ===
+def show_uncnown_mine_dialog():
+    dialog = tk.Toplevel(root)
+    dialog.title("Нет вычисляемых ходов")
+    dialog.geometry("300x150")
+    dialog.transient(root)
+    dialog.grab_set()
 
-root = tk.Tk()
-root.title("Сапёр: Цветовой анализатор")
-root.geometry("400x300")
-root.resizable(False, False)
+    tk.Label(dialog, text="Нажмите 'ОК', чтобы продолжить").pack(pady=5)
 
-tk.Label(root, text="Сапёр: Анализ цветов", font=("Arial", 16)).pack(pady=10)
+    def resume():
+        dialog.destroy()
+        global pause_solver
+        pause_solver = False  # Возобновляем работу решателя
 
-frame = tk.Frame(root)
-frame.pack(pady=10)
+    tk.Button(dialog, text="Ок", command=resume).pack(pady=5)
 
-tk.Label(frame, text="Ширина поля:", width=15, anchor='w').grid(row=0, column=0, padx=5, pady=5)
-width_entry = tk.Entry(frame, width=10)
-width_entry.grid(row=0, column=1, padx=5, pady=5)
-width_entry.insert(0, "10")
+    root.wait_window(dialog)
 
-tk.Label(frame, text="Высота поля:", width=15, anchor='w').grid(row=1, column=0, padx=5, pady=5)
-height_entry = tk.Entry(frame, width=10)
-height_entry.grid(row=1, column=1, padx=5, pady=5)
-height_entry.insert(0, "10")
+# ==============================
+# === Системные функции ========
+# ==============================
 
-tk.Label(frame, text="Количество мин:", width=15, anchor='w').grid(row=2, column=0, padx=5, pady=5)
-mines_entry = tk.Entry(frame, width=10)
-mines_entry.grid(row=2, column=1, padx=5, pady=5)
-mines_entry.insert(0, "10")
+def listen_for_escape():
+    global stop_solver
+    keyboard.wait('esc')
+    stop_solver = True
+    print("\n[INFO] Нажата клавиша ESC. Завершение работы...")
 
-btn_select_cell = tk.Button(frame, text="Определить цвет ячейки", width=25, command=select_cell_area)
-btn_select_cell.grid(row=0, column=0, padx=5, pady=5)
 
-btn_play = tk.Button(frame, text="Играть", width=25, command=select_game_area)
-btn_play.grid(row=1, column=0, padx=5, pady=5)
 
-color_label = tk.Label(root, text="Цвет", width=20, height=3, relief="solid")
-color_label.pack(pady=10)
+# ==============================
+# === Точка входа ============
+# ==============================
 
-color_value = tk.Label(root, text="RGB(?, ?, ?)", font=("Courier", 12))
-color_value.pack()
+if __name__ == "__main__":
+    root = tk.Tk()
+    root.title("Сапёр: Цветовой анализатор")
+    root.geometry("400x400")
+    root.resizable(False, False)
 
-root.mainloop()
+    tk.Label(root, text="Сапёр: Анализ цветов", font=("Arial", 16)).pack(pady=10)
+
+    # Поля ввода настроек
+    settings_frame = tk.Frame(root)
+    settings_frame.pack(pady=10)
+
+    tk.Label(settings_frame, text="Ширина поля:", width=15, anchor='w').grid(row=0, column=0, padx=5, pady=5)
+    global width_entry
+    width_entry = tk.Entry(settings_frame, width=10)
+    width_entry.grid(row=0, column=1, padx=5, pady=5)
+    width_entry.insert(0, "10")
+
+    tk.Label(settings_frame, text="Высота поля:", width=15, anchor='w').grid(row=1, column=0, padx=5, pady=5)
+    global height_entry
+    height_entry = tk.Entry(settings_frame, width=10)
+    height_entry.grid(row=1, column=1, padx=5, pady=5)
+    height_entry.insert(0, "10")
+
+    tk.Label(settings_frame, text="Количество мин:", width=15, anchor='w').grid(row=2, column=0, padx=5, pady=5)
+    global mines_entry
+    mines_entry = tk.Entry(settings_frame, width=10)
+    mines_entry.grid(row=2, column=1, padx=5, pady=5)
+    mines_entry.insert(0, "10")
+
+    # Кнопки
+    btn_frame = tk.Frame(root)
+    btn_frame.pack(pady=10)
+
+    tk.Button(btn_frame, text="Определить цвет ячейки", width=25, command=select_cell_area).grid(
+        row=0, column=0, padx=5, pady=5)
+
+    tk.Button(btn_frame, text="Играть", width=25, command=select_game_area).grid(
+        row=1, column=0, padx=5, pady=5)
+
+    # Отображение цвета
+    global color_label, color_value
+    color_label = tk.Label(root, text="Цвет", width=20, height=3, relief="solid")
+    color_label.pack(pady=10)
+
+    color_value = tk.Label(root, text="RGB(?, ?, ?)", font=("Courier", 12))
+    color_value.pack()
+
+    root.mainloop()
+
+
