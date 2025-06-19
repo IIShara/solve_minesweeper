@@ -1,0 +1,6 @@
+# created by virtualenv automatically
+Scripts/
+site-packages/
+templates/
+pyvenv.cfg
+save.py
