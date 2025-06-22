@@ -1,5 +1,8 @@
 import tkinter as tk
-from PIL import ImageGrab, Image, ImageDraw
+from datetime import datetime
+from turtledemo.nim import COLOR
+
+from PIL import ImageGrab, Image, ImageDraw, ImageTk
 import numpy as np
 import cv2
 import time
@@ -8,12 +11,105 @@ import random
 import keyboard
 import threading
 from itertools import combinations
+import pytesseract
+from computer_vision import find_minesweeper_field
+import os
+from datetime import datetime
 
-
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+TEMPLATES_DIR = "templates"
 # === Глобальные переменные ===
 stop_solver = False
 pause_solver = False
+templates = {}  # templates['X'] = [template1, template2, ...]
+LOG_LEVEL = 'INFO'
+start_time = None  # ← время начала решения
 
+COLOR_MAP = {
+    '0': '\033[90m',   # Серый
+    '1': '\033[94m',   # Ярко-синий
+    '2': '\033[92m',   # Зелёный
+    '3': '\033[93m',   # Жёлтый
+    '4': '\033[33m',   # Оранжевый (нельзя через стандартные ANSI, но можно эмулировать)
+    '5': '\033[35m',   # Фиолетовый
+    '6': '\033[36m',   # Бирюзовый
+    '7': '\033[91m',   # Красный
+    '8': '\033[34m',   # Тёмно-синий
+    'F': '\033[91m',   # Красный
+    'X': '\033[30m',   # Чёрный
+    '?': '\033[93m',  # Жёлтый (неопределённая ячейка)
+}
+RESET = '\033[0m'
+SUCCESS = '\033[92m'
+ERROR = '\033[91m'
+WARNING = '\033[93m'
+
+def load_templates():
+    """
+    Загружает все шаблоны из папки templates/
+    Имя файла должно быть в формате:
+        X_1.png, X_2.png
+        F_1.png, F_2.png
+        1_1.png, 1_2.png
+    """
+    global templates
+    templates.clear()
+
+    if not os.path.exists(TEMPLATES_DIR):
+        print(f"[ERROR] Папка шаблонов не найдена: {TEMPLATES_DIR}")
+        return
+
+    # Перебираем все файлы в папке
+    for filename in os.listdir(TEMPLATES_DIR):
+        if filename.endswith('.png') or filename.endswith('.jpg'):
+            full_path = os.path.join(TEMPLATES_DIR, filename)
+
+            # Парсим имя файла: например, X_1.png → label = 'X', номер = 1
+            if '_' in filename and '.' in filename:
+                base_label = filename.split('_')[0]
+                try:
+                    # Загружаем как grayscale
+                    img = cv2.imread(full_path, 0)
+                    if img is None:
+                        print(f"[ERROR] Не удалось прочитать изображение: {full_path}")
+                        continue
+
+                    # Добавляем в словарь по типу ('X', 'F', '1', ...)
+                    if base_label not in templates:
+                        templates[base_label] = []
+                    templates[base_label].append(img)
+                    print(f"[INFO] Шаблон загружен: {base_label}")
+                except Exception as e:
+                    print(f"[ERROR] Неверное имя файла: {filename} | {e}")
+            else:
+                print(f"[WARNING] Имя файла не соответствует формату: {filename}")
+
+def print_colored_board(board):
+    # === Цвета для консоли ===
+    COLOR_MAP = {
+        '0': '\033[90m',   # Серый
+        '1': '\033[94m',   # Ярко-синий
+        '2': '\033[92m',   # Зелёный
+        '3': '\033[93m',   # Жёлтый
+        '4': '\033[33m',   # Оранжевый (нельзя через стандартные ANSI, но можно эмулировать)
+        '5': '\033[35m',   # Фиолетовый
+        '6': '\033[36m',   # Бирюзовый
+        '7': '\033[91m',   # Красный
+        '8': '\033[34m',   # Тёмно-синий
+        'F': '\033[91m',   # Красный
+        'X': '\033[30m',   # Чёрный
+        '?': '\033[93m',  # Жёлтый (неопределённая ячейка)
+    }
+    RESET = '\033[0m'
+    def print_colored_board(board):
+        print("\n[DEBUG] Текущее состояние доски:")
+    for row in board:
+        line = ""
+        for cell in row:
+            color_code = COLOR_MAP.get(cell, RESET)  # Если не найден — белый
+            line += f"{color_code}{cell}{RESET} "
+        print("  ", line)
+    print(RESET)
 # ==============================
 # === Выбор области экрана ====
 # ==============================
@@ -57,7 +153,7 @@ class AreaSelectorApp:
         self.root.mainloop()
 
 # ==============================
-# === Распознавание цветов ====
+# === Распознавание ячеек ====
 # ==============================
 def cell_color_to_type(cell_img):
     global pause_solver
@@ -66,24 +162,57 @@ def cell_color_to_type(cell_img):
     img_array = np.array(img)
 
     h, w, _ = img_array.shape
-    pad_w, pad_h = w // 10, h // 10
-    center = img_array[pad_h:h - pad_h, pad_w:w - pad_w]
+
+    # === ОБРЕЗАЕМ КРАЯ (оставляем 80% в центре)
+    border_percent = 0.3  # 50%
+    border_h = int(h * border_percent)
+    border_w = int(w * border_percent)
+
+    center = img_array[border_h:h - border_h, border_w:w - border_w]  # Центральная область
 
     avg_color = np.mean(center, axis=(0, 1)).astype(int)  # RGB среднее
 
+    # CELL_COLORS = {
+    #     '0':        (172, 171, 172),
+    #     'X':        (186, 187, 189),
+    #     'F':        (175, 164, 166),
+    #     '1':        (143, 142, 187),
+    #     '2':        (123,159, 123),
+    #     '3':        (195, 127, 128),
+    #     '4':        (130, 128, 162),
+    #     '5':        (161, 124, 126),
+    #     '6':        (0, 0, 0),
+    #     '7':        (0, 0, 0),
+    #     '8':        (133, 154, 154),
+    # }
+
     CELL_COLORS = {
-        '0':        (172, 171, 172),
-        'X':        (186, 187, 189),
-        'F':        (175, 164, 166),
-        '1':        (143, 142, 187),
-        '2':        (123,159, 123),
-        '3':        (195, 127, 128),
-        '4':        (130, 128, 162),
-        '5':        (161, 124, 126),
-        '6':        (0, 0, 0),
-        '7':        (0, 0, 0),
-        '8':        (133, 154, 154),
+        '0':        [(82, 63, 44),
+                     (82, 62, 43),
+                     (77, 58, 41)],
+        'X':        [(82, 97, 30),
+                     (95, 100, 35),
+                     (107, 105, 41),
+                     (117, 122, 46),
+                     (116, 109, 44),
+                     (50, 129, 166),
+                     (180, 146, 62),
+                     (80, 128, 157),
+                     (38, 111, 154),
+                     (129, 113, 31)],
+        'F':        [(220, 153, 151),
+                     (175,121,114),
+                     (160, 130, 89),
+                     (202, 143, 135),
+                     (107, 123, 41)],
+        '1':        [(94, 98, 44)],
+        '2':        [(113, 115, 36)],
+        '3':        [(116, 97, 26)],
+        '4':        [(118, 81, 25)],
+        '5':        [(122, 61, 23)],
+        '6':        [(128, 53, 21)],
     }
+
 
     def color_distance(c1, c2):
         return sum((a - b) ** 2 for a, b in zip(c1, c2))
@@ -91,26 +220,301 @@ def cell_color_to_type(cell_img):
     min_dist = float('inf')
     closest_type = '?'
 
-    for label, color in CELL_COLORS.items():
-        dist = color_distance(avg_color, color)
-        if dist < min_dist:
-            min_dist = dist
-            closest_type = label
+    for label, color_list in CELL_COLORS.items():
+        for color in color_list:
+            dist = color_distance(avg_color, color)
+            if dist < min_dist:
+                min_dist = dist
+                closest_type = label
 
-    if min_dist > 3000:  # Можно настроить порог
+    if min_dist > 300:  # Можно настроить порог
         print(f"[DEBUG] Неопределённая ячейка | Цвет: {avg_color}, дистанция: {min_dist}")
-        pause_solver = True
-        root.bell()
-        show_unknown_color_dialog(avg_color)
-
-        return '?'
-
+        return cell_ocr_to_type(cell_img)
+        show_unknown_color_dialog(cell_img)
+        return 'X'
+    color_code = COLOR_MAP.get(closest_type, RESET)
+    print(f"[DEBUG][COLOR] Ячейка распознана как: {color_code}{closest_type}{RESET} (дистанция: {min_dist}) | Цвет: {avg_color}")
     return closest_type
+
+def preprocess(img):
+    # Градации серого
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+    # Повышаем резкость
+    sharpen_kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+    sharpened = cv2.filter2D(gray, -1, sharpen_kernel)
+
+    # Улучшаем контраст
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(sharpened)
+
+    return enhanced
+
+def cell_template_to_type(cell_img):
+    global pause_solver, stop_solver
+    cell_array = np.array(cell_img.convert('RGB'))
+    gray_cell = cv2.cvtColor(cell_array, cv2.COLOR_RGB2GRAY)
+
+    h, w = gray_cell.shape
+    pad_w, pad_h = int(w * 0.1), int(h * 0.1)  # 5% от края
+    center = gray_cell[pad_h:h - pad_h, pad_w:w - pad_w]  # Центральная область (90%)
+
+    best_label = 'X'
+    best_score = 0.0
+
+    for label, template_list in templates.items():
+        for template in template_list:
+            # # Уменьшаем размер шаблона на 10%
+            # scaled_template = cv2.resize(template, (int(template.shape[1] * 0.9), int(template.shape[0] * 0.9)))
+            if gray_cell.shape[:2] != template.shape:
+                continue
+
+            result = cv2.matchTemplate(gray_cell, template, cv2.TM_CCOEFF_NORMED)
+            score = result[0][0]
+
+            if score > best_score and score > 0.8:
+                best_score = score
+                best_label = label
+
+    CONFIDENCE_THRESHOLD = 0.8
+    if best_score < CONFIDENCE_THRESHOLD:
+        print(f"[DEBUG] Неопределённая ячейка | Дистанция: {best_score:.2f}")
+        return cell_color_to_type(cell_img)
+        show_unknown_color_dialog(cell_img)
+    color_code = COLOR_MAP.get(best_label, RESET)
+    print(f"[DEBUG][TEMPLATE] Ячейка распознана как: {color_code}{best_label}{RESET} (score={best_score:.2f})")
+    return best_label
+
+def cell_ocr_to_type(cell_img):
+    """
+    Распознаёт тип ячейки через OCR после предобработки
+    :param cell_img: PIL.Image — изображение ячейки
+    :return: тип ячейки ('1', '2', ..., '?')
+    """
+    # Конвертируем в NumPy массив
+    img = np.array(cell_img.convert('RGB'))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+    # Увеличиваем резкость
+    sharpen_kernel = np.array([[-1, -1, -1],
+                               [-1, 9, -1],
+                               [-1, -1, -1]])
+    sharpened = cv2.filter2D(gray, -1, sharpen_kernel)
+
+    # Бинаризация + инверсия
+    _, binary = cv2.threshold(sharpened, 127, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+
+    # Дополнительный шумоподавляющий фильтр
+    binary = cv2.medianBlur(binary, 3)
+
+    # === Отладка: покажем, что видит OCR ===
+    # cv2.imshow("OCR Input", binary)
+    # cv2.waitKey(0)
+
+    # Распознаём цифры
+    config = '--psm 10 --oem 3 -c tessedit_char_whitelist=012345678'
+    text = pytesseract.image_to_string(binary, config=config).strip()
+
+    if text.isdigit() and 1 <= int(text) <= 8:
+        color_code = COLOR_MAP.get(text, RESET)
+        print(f"[DEBUG][OCR] Ячейка распознана как: {color_code}{text}{RESET}")
+        return text
+    else:
+        print(f"[DEBUG] OCR не смог распознать число: '{text}'")
+        # show_unknown_color_dialog(cell_img)
+        return 'X'
+# ==============================
+# = Распознавание игрового поля =
+# ==============================
+
+def overlay_game_area(area, cell_size):
+    """
+    Отображает оверлей вокруг выбранной области
+    """
+    x1, y1, x2, y2 = area
+    width = x2 - x1
+    height = y2 - y1
+
+    # Создаем прозрачное окно
+    overlay_root = tk.Tk()
+    overlay_root.overrideredirect(True)  # Убираем рамку окна
+    overlay_root.geometry(f"{width}x{height}+{x1}+{y1}")
+    overlay_root.lift()
+    overlay_root.attributes("-topmost", True)
+    overlay_root.attributes("-transparentcolor", "black")  # Черный цвет станет прозрачным
+
+    # Canvas для рисования рамки
+    canvas = tk.Canvas(overlay_root, width=width, height=height, highlightthickness=0, bd=0, bg="black")
+    canvas.pack()
+
+    # Рисуем рамку
+    canvas.create_rectangle(0, 0, width, height, outline='red', width=3)
+
+    # Рисуем сетку
+    for row in range(0, height, cell_size):
+        canvas.create_line(0, row, width, row, fill="red", width=1)
+
+    for col in range(0, width, cell_size):
+        canvas.create_line(col, 0, col, height, fill="red", width=1)
+
+    # === Диалог подтверждения ===
+    def on_confirm():
+        print("[ACTION] Область подтверждена")
+        overlay_root.destroy()
+        callback(area)
+
+    # Показываем диалог
+    dialog = tk.Toplevel(overlay_root)
+    dialog.title("Подтверждение области")
+    dialog.geometry("300x150")
+    dialog.transient(overlay_root)
+    dialog.grab_set()
+
+    tk.Label(dialog, text="Подтвердите игровое поле:", font=("Arial", 12)).pack(pady=10)
+    tk.Label(dialog, text=f"({x1}, {y1}) → ({x2}, {y2})", font=("Courier", 10)).pack(pady=5)
+
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(pady=20)
+
+    tk.Button(btn_frame, text="Продолжить", width=10, command=on_confirm).pack(side=tk.LEFT, padx=10)
+
+    overlay_root.wait_window(dialog)  # Ждём ответа пользователя
+
+def validate_area(area, board_height_count, board_width_count, cell_size):
+    x1, y1, x2, y2 = area
+    width = x2 - x1
+    height = y2 - y1
+    if abs(width - board_width_count * cell_size) > cell_size:
+        return False
+    if abs(height - board_height_count * cell_size) > cell_size:
+        return False
+    return True
+
+def detect_cell_size(template_path='templates/X_dota.png'):
+    """
+    Определяет размер ячейки по шаблону
+    :param template_path: путь к файлу с шаблоном ячейки
+    :return: размер ячейки (int) или None
+    """
+    if not os.path.exists(template_path):
+        print(f"[ERROR] Шаблон не найден: {template_path}")
+        return None
+
+    # Загружаем шаблон
+    template = cv2.imread(template_path)
+    if template is None:
+        print(f"[ERROR] Не удалось загрузить шаблон: {template_path}")
+        return None
+
+    h, w = template.shape[:2]
+    cell_size = min(h, w)
+
+    print(f"[INFO] Размер ячейки определён: {cell_size}x{cell_size}")
+    return cell_size
+
+def find_minesweeper_field(board_width_count, board_height_count, CELL_SIZE, template_dir=os.path.join(TEMPLATES_DIR, "fields"), threshold=0.9):
+    """
+   Перебирает несколько шаблонов игрового поля и возвращает первую найденную область
+   :param template_dir: папка с шаблонами полей
+   :param threshold: порог совпадения
+   :return: координаты области (x1, y1, x2, y2), или None
+   """
+    if not os.path.exists(template_dir):
+        print(f"[ERROR] Папка с шаблонами поля не найдена: {template_dir}")
+        return None
+
+    # Получаем список всех шаблонов в папке
+    templates = [f for f in os.listdir(template_dir) if f.endswith(".png") or f.endswith(".jpg")]
+    if not templates:
+        print(f"[INFO] Нет шаблонов в папке {template_dir}")
+        return None
+
+    # Делаем скриншот всего экрана
+    screen_img = np.array(ImageGrab.grab())
+    screen_gray = cv2.cvtColor(screen_img, cv2.COLOR_RGB2GRAY)
+
+    # Перебираем шаблоны
+    for template_file in templates:
+        template_path = os.path.join(template_dir, template_file)
+        template = cv2.imread(template_path, 0)
+        if template is None:
+            print(f"[ERROR] Не удалось загрузить шаблон: {template_file}")
+            continue
+
+        tw, th = template.shape[::-1]
+        res = cv2.matchTemplate(screen_gray, template, cv2.TM_CCOEFF_NORMED)
+        loc = np.where(res >= threshold)
+
+        matches = list(zip(*loc[::-1]))
+        if matches:
+            top_left = matches[0]
+            bottom_right = (top_left[0] + tw, top_left[1] + th)
+            field_coords = (*top_left, *bottom_right)
+            if validate_area(field_coords, board_height_count, board_width_count, cell_size=CELL_SIZE):
+                print(f"[SUCCESS] Поле найдено по шаблону '{template_file}': {field_coords}")
+                overlay_game_area(field_coords, CELL_SIZE)
+                return field_coords
+
+    print("[INFO] Поле Сапёра не найдено")
+    return None
+
+
+
+
+# def find_minesweeper_field(template_path='templates/field_template.png', threshold=0.95):
+#     """
+#     Ищет область игрового поля Сапёра на экране.
+#
+#     :param template_path: путь к шаблону поля
+#     :param threshold: порог совпадения
+#     :return: координаты найденной области (x1, y1, x2, y2) или None
+#     """
+#
+#     # Загрузка шаблона
+#     if not os.path.exists(template_path):
+#         print(f"[ERROR] Шаблон не найден: {template_path}")
+#         return None
+#
+#     template = cv.imread(template_path)
+#     template_gray = cv.cvtColor(template, cv.COLOR_BGR2GRAY)
+#     tw, th = template_gray.shape[::-1]
+#
+#     # Делаем скриншот всего экрана
+#     screen_img = ImageGrab.grab()
+#     screen_array = np.array(screen_img)
+#     screen_gray = cv.cvtColor(screen_array, cv.COLOR_BGR2GRAY)
+#
+#     # Поиск шаблона
+#     res = cv.matchTemplate(screen_gray, template_gray, cv.TM_CCOEFF_NORMED)
+#     loc = np.where(res >= threshold)
+#
+#     matches = list(zip(*loc[::-1]))
+#
+#     if not matches:
+#         print("[INFO] Поле Сапёра не найдено")
+#         return None
+#
+#     # Берём первое совпадение как основное
+#     top_left = matches[0]
+#     bottom_right = (top_left[0] + tw, top_left[1] + th)
+#
+#     print(f"[SUCCESS] Найдено игровое поле: {top_left} → {bottom_right}")
+#
+#     # Визуализация результата (опционально)
+#     result_img = screen_array.copy()
+#     cv.rectangle(result_img, top_left, bottom_right, (0, 0, 255), 2)
+#     cv.imshow("Found Field", result_img)
+#     cv.waitKey(1000)
+#     cv.destroyAllWindows()
+#
+#     return (*top_left, *bottom_right)
+
 
 # ==============================
 # === Работа с игровым полем ==
 # ==============================
 def analyze_board(area, cell_size):
+    global stop_solver
     board_image = ImageGrab.grab(bbox=area)
     board_width = area[2] - area[0]
     board_height = area[3] - area[1]
@@ -128,8 +532,11 @@ def analyze_board(area, cell_size):
             y2 = y1 + cell_size
 
             cell_img = board_image.crop((x1, y1, x2, y2))
-            cell_type = cell_color_to_type(cell_img)
+            cell_type = cell_template_to_type(cell_img)
             line.append(cell_type)
+            if stop_solver:
+                print("[INFO] Прерывание по ESC.")
+                break
         board_state.append(line)
 
     return board_state
@@ -166,65 +573,155 @@ def is_game_over(board, total_mines=0):
         print("[INFO] Все мины найдены и отмечены. Игра завершена.")
         return True
 
+    # Сценарий 2: Все мины помечены, остальные — можно открыть
+    if flagged_cells == total_mines and closed_cells > 0:
+        print(f"[ACTION] Все мины найдены! Осталось {closed_cells} безопасных ячеек для открытия")
+        return False  # Не завершаем игру — решатель должен открыть их
+
+    return False
+
     return False
 
 # ==============================
 # === Логика решения игры ====
 # ==============================
-def find_mandatory_mines(board):
+def get_cell_real_count_mines(board, total_mines=0):
+    closed_cells = []
+    flagged_cells = 0
+
+    for row_idx, row in enumerate(board):
+        for col_idx, cell in enumerate(row):
+            if cell == 'X':
+                closed_cells.append((row_idx, col_idx))
+            elif cell == 'F':
+                flagged_cells += 1
+
+    return (total_mines - flagged_cells)
+
+def find_cells_with_known_mines(board):
     mandatory_mines = []
     safe_cells = []
 
-    # Собираем информацию о числах и их соседях
-    number_constraints = {}
+    number_cells = []
+
     for row in range(len(board)):
         for col in range(len(board[0])):
             if board[row][col].isdigit() and board[row][col] != '0':
                 count = int(board[row][col])
                 neighbors = get_neighbors(board, row, col)
-                unknown = [n for n in neighbors if board[n[0]][n[1]] == 'X']
                 flagged = [n for n in neighbors if board[n[0]][n[1]] == 'F']
+                unknown = [n for n in neighbors if board[n[0]][n[1]] == 'X']
+                remaining = count - len(flagged)
+                number_cells.append({
+                    'pos': (row, col),
+                    'count': count,
+                    'flagged': flagged,
+                    'unknown': unknown,
+                    'remaining': remaining
+                })
 
-                # Оставшиеся неизвестные ячейки
-                remaining_unknown = len(unknown) - len(flagged)
+    # === ОДИНОЧНАЯ ОБРАБОТКА ЧИСЕЛ ===
 
-                if remaining_unknown > 0:
-                    number_constraints[(row, col)] = {
-                        'count': count,
-                        'unknown': unknown,
-                        'flagged': flagged,
-                        'remaining': remaining_unknown
-                    }
+    for data in number_cells:
+        move = False
+        unknown = data['unknown']
+        flagged = data['flagged']
+        count = data['count']
+        # print(f"[SOLO] Анализируем ячейку {data['pos']}")
+        # print(f"   └── Неизвестные: {unknown}")
+        # print(f"   └── Нужно мин: {count}")
+        # print(f"   └── Помечено мин: {flagged}")
+        # Случай 1: Все флаги уже поставлены → открываем остальные
+        if count == len(flagged):
+            for r, c in unknown:
+                safe_cells.append((r, c))
+                # print(f"[SOLO] Открываем ячейку {r, c}")
+                move = True
+                # break  # Выходим из цикла и обновляем доску
 
-    # Проверяем пересечения между числами
-    keys = list(number_constraints.keys())
-    for i in range(len(keys)):
-        for j in range(i + 1, len(keys)):
-            cell1 = keys[i]
-            cell2 = keys[j]
+        # Случай 2: Осталось ровно столько мин → ставим флаги
+        elif count == len(flagged) + len(unknown):
+            for r, c in unknown:
+                mandatory_mines.append((r, c))
+                # print(f"[SOLO] Помечаем ячейку {r, c} миной")
+                move = True
+                # break  # Выходим из цикла и обновляем доску
+    return list(set(mandatory_mines)), list(set(safe_cells))
 
-            # Получаем данные для двух чисел
-            data1 = number_constraints[cell1]
-            data2 = number_constraints[cell2]
+def find_safe_cells(board, total_mines=0):
+    mandatory_mines = []
+    safe_cells = []
+    end = False
 
-            # Находим общие неизвестные ячейки
-            common_unknown = set(data1['unknown']) & set(data2['unknown'])
+    number_cells = []
 
-            # Если количество мин совпадает с количеством общих ячеек
-            if data1['remaining'] == len(common_unknown) and data2['remaining'] == len(common_unknown):
-                mandatory_mines.extend(common_unknown)
+    for row in range(len(board)):
+        for col in range(len(board[0])):
+            if board[row][col].isdigit() and board[row][col] != '0':
+                count = int(board[row][col])
+                neighbors = get_neighbors(board, row, col)
+                flagged = [n for n in neighbors if board[n[0]][n[1]] == 'F']
+                unknown = [n for n in neighbors if board[n[0]][n[1]] == 'X']
+                remaining = count - len(flagged)
+                number_cells.append({
+                    'pos': (row, col),
+                    'count': count,
+                    'flagged': flagged,
+                    'unknown': unknown,
+                    'remaining': remaining
+                })
 
-            # Если общих ячеек больше, чем нужно минам
-            elif len(common_unknown) > max(data1['remaining'], data2['remaining']):
-                # Ячейки, которые точно безопасны
-                safe_cells.extend(common_unknown)
 
-    return mandatory_mines, safe_cells
+    # Перебираем все пары чисел
+    for i in range(len(number_cells)):
+        data1 = number_cells[i]
+        for j in range(i + 1, len(number_cells)):
+            data2 = number_cells[j]
+
+            common = set(data1['unknown']) & set(data2['unknown'])
+            all_unknown = set(data1['unknown']) | set(data2['unknown'])
+            if not common:
+                continue
+
+            print(f"[GROUP] Сравниваем {data1['pos']} и {data2['pos']}")
+            print(f"   └── Общие неизвестные: {common}")
+            print(f"   └── Всё неизвестные: {all_unknown}")
+            print(f"   └── Нужно мин: {data1['remaining']}, {data2['remaining']}")
+
+
+            # === Случай 1: все ячейки кроме общих — безопасны  ===
+            if (data1['remaining'] + data2['remaining'] == len(common) and
+                    (len(data1['unknown']) == len(common) or len(data2['unknown']) == len(common)) and
+                    len(all_unknown) > len(common)):
+                print("   ✅ Все ячейки кроме общих — безопасны")
+                safe_cells.extend(all_unknown - common)
+
+            # === Случай 2: число мин меньше количества общих ячеек ===
+            elif ((len(data1['unknown']) == len(common) or len(data2['unknown']) == len(common)) and
+                  (data1['remaining'] + data2['remaining'] == len(all_unknown)) and len(all_unknown) > len(common)):
+                mandatory_mines.extend(all_unknown - common)
+                print(f"   ✅ Нужно пометить {all_unknown - common} как мины")
+
+            else:
+                real_count_mines = get_cell_real_count_mines(board, total_mines)
+                print(f"   └── количество мин: {real_count_mines}")
+                if len(common) == real_count_mines and data1['remaining'] == data2['remaining'] == real_count_mines:
+                    mandatory_mines.extend(common)
+                    print(f"   ✅ Ячейка {common} — единственная возможная мина")
+                    end = True
+
+            if end:
+                break
+        if end:
+            break
+
+    return list(set(mandatory_mines)), list(set(safe_cells))
 
 def solve_minesweeper(area, cell_size=20, total_mines=10):
     global stop_solver
     global pause_solver
     stop_solver = False
+    start_time = time.time()  # ← запоминаем время старта
 
     # Запускаем прослушивание Esc в отдельном потоке
     escape_thread = threading.Thread(target=listen_for_escape, daemon=True)
@@ -239,70 +736,82 @@ def solve_minesweeper(area, cell_size=20, total_mines=10):
                 print("[INFO] Продолжаю выполнение...")
                 continue
             board = analyze_board(area, cell_size)
-
             # Проверяем, не закончилась ли игра
             if is_game_over(board, total_mines):
-                print("[SUCCESS] Игра успешно решена!")
+                end_time = time.time()
+                elapsed = end_time - start_time
+                print(f"{SUCCESS}[SUCCESS] Игра решена за {int(elapsed)} секунд{RESET}")
                 break
 
-            print("Текущее состояние доски:")
-            for row in board:
-                print(row)
+            print_colored_board(board)
 
             made_move = False
 
-            for row_idx, row in enumerate(board):
-                for col_idx, cell in enumerate(row):
-                    if cell.isdigit() and cell != '0':
-                        count = int(cell)
-                        neighbors = get_neighbors(board, row_idx, col_idx)
-
-                        unknown = [n for n in neighbors if board[n[0]][n[1]] == 'X']
-                        flagged = [n for n in neighbors if board[n[0]][n[1]] == 'F']
-
-                        # Случай 1: Все флаги уже поставлены → открываем остальные
-                        if count == len(flagged):
-                            for r, c in unknown:
-                                print(f"[ACTION] Открываем [{r}][{c}]")
-                                click(area, r, c, right_click=False, CELL_SIZE=cell_size)
-                                time.sleep(0.1)
-                                made_move = True
-                                break  # Выходим из цикла и обновляем доску
-
-                        # Случай 2: Осталось ровно столько мин → ставим флаги
-                        elif count == len(flagged) + len(unknown):
-                            for r, c in unknown:
-                                print(f"[ACTION] Ставим флаг на [{r}][{c}]")
-                                click(area, r, c, right_click=True, CELL_SIZE=cell_size)
-                                time.sleep(0.1)
-                                made_move = True
-                                break  # Выходим из цикла и обновляем доску
-
-                            if made_move:
-                                break  # Перезапускаем анализ
-                    if made_move:
-                        break
-
             # === Анализ обязательных мин ===
             if not made_move:
-                mandatory_mines, safe_cells = find_mandatory_mines(board)
+                mandatory_mines, safe_cells = find_cells_with_known_mines(board)
 
                 if mandatory_mines:
                     print("[ACTION] Найдены обязательные мины:")
                     for r, c in mandatory_mines:
                         print(f"Флаг на [{r}][{c}]")
                         click(area, r, c, right_click=True, CELL_SIZE=cell_size)
+                        time.sleep(0.1)
                     made_move = True
 
-                elif safe_cells:
+                if safe_cells:
                     print("[ACTION] Найдены безопасные ячейки:")
                     for r, c in safe_cells:
                         print(f"Открытие [{r}][{c}]")
                         click(area, r, c, right_click=False, CELL_SIZE=cell_size)
+                        time.sleep(0.1)
+                    made_move = True
+
+
+            if not made_move:
+                mandatory_mines, safe_cells = find_safe_cells(board, total_mines)
+
+                if mandatory_mines:
+                    print("[ACTION] Найдены обязательные мины:")
+                    for r, c in mandatory_mines:
+                        print(f"Флаг на [{r}][{c}]")
+                        click(area, r, c, right_click=True, CELL_SIZE=cell_size)
+                        time.sleep(0.1)
+                    made_move = True
+
+                if safe_cells:
+                    print("[ACTION] Найдены безопасные ячейки:")
+                    for r, c in safe_cells:
+                        print(f"Открытие [{r}][{c}]")
+                        click(area, r, c, right_click=False, CELL_SIZE=cell_size)
+                        time.sleep(0.1)
                     made_move = True
 
             if not made_move:
-                print("[INFO] Нет явных ходов. Предоставляется выбор пользователю...")
+                print("[INFO] Нет явных ходов. Проверяем, остались ли только безопасные ячейки...")
+
+                # Если все мины найдены, открываем все оставшиеся 'X'
+                closed_cells = []
+                flagged_cells = 0
+
+                for row_idx, row in enumerate(board):
+                    for col_idx, cell in enumerate(row):
+                        if cell == 'X':
+                            closed_cells.append((row_idx, col_idx))
+                        elif cell == 'F':
+                            flagged_cells += 1
+
+                if flagged_cells == total_mines and len(closed_cells) > 0:
+                    print(f"[ACTION] Все мины найдены. Открываем {len(closed_cells)} ячеек")
+                    for r, c in closed_cells:
+                        print(f"[ACTION] Открываем [{r}][{c}]")
+                        click(area, r, c, right_click=False, CELL_SIZE=cell_size)
+                        # time.sleep(0.1)
+                        made_move = True
+                        break  # После одного клика обновляем доску
+
+            if not made_move:
+                print(f"{WARNING}[INFO] Нет явных ходов. Предоставляется выбор пользователю...{RESET}")
                 pause_solver = True
                 show_uncnown_mine_dialog()
 
@@ -311,77 +820,11 @@ def solve_minesweeper(area, cell_size=20, total_mines=10):
                 print("[INFO] Прерывание по ESC.")
                 break
 
-        time.sleep(0.1)
+        time.sleep(1)
 
     except KeyboardInterrupt:
         print("Решатель остановлен пользователем.")
-
-# def analyze_groups(board):
-#     rows = len(board)
-#     cols = len(board[0])
-#
-#     # Словарь для хранения информации о группах
-#     groups = {}
-#
-#     # Проходим по всем числам
-#     for row in range(rows):
-#         for col in range(cols):
-#             if board[row][col].isdigit():
-#                 count = int(board[row][col])
-#                 neighbors = get_neighbors(board, row, col)
-#
-#                 # Соседние ячейки
-#                 unknown = [n for n in neighbors if board[n[0]][n[1]] == 'X']
-#                 flagged = [n for n in neighbors if board[n[0]][n[1]] == 'F']
-#
-#                 # Если число мин уже известно
-#                 if count == len(flagged):
-#                     # Открываем все незакрытые ячейки
-#                     for r, c in unknown:
-#                         yield ('open', r, c)
-#                 elif count == len(flagged) + len(unknown):
-#                     # Ставим флаги на все незакрытые ячейки
-#                     for r, c in unknown:
-#                         yield ('flag', r, c)
-#                 else:
-#                     # Добавляем эту группу в список для дальнейшего анализа
-#                     key = (row, col)
-#                     groups[key] = {
-#                         'count': count,
-#                         'unknown': unknown,
-#                         'flagged': flagged,
-#                     }
-#
-#     # Теперь анализируем группы вместе
-#     for group_key, group_data in groups.items():
-#         count = group_data['count']
-#         unknown = group_data['unknown']
-#         flagged = group_data['flagged']
-#
-#         # Проверяем пересечения с другими группами
-#         for other_key, other_data in groups.items():
-#             if other_key != group_key:
-#                 other_count = other_data['count']
-#                 other_unknown = other_data['unknown']
-#                 other_flagged = other_data['flagged']
-#
-#                 # Найдём общих соседей
-#                 common_unknown = list(set(unknown) & set(other_unknown))
-#                 if common_unknown:
-#                     # Вычисляем, сколько мин могут быть в общих соседях
-#                     total_mines = min(count - len(flagged), other_count - len(other_flagged))
-#
-#                     # Если общие соседи меньше или равны количеству мин
-#                     if len(common_unknown) <= total_mines:
-#                         # Ставим флаги на всех общих соседях
-#                         for r, c in common_unknown:
-#                             yield ('flag', r, c)
-#                     elif len(common_unknown) == total_mines:
-#                         # Открываем все другие незакрытые ячейки
-#                         for r, c in unknown:
-#                             if (r, c) not in common_unknown:
-#                                 yield ('open', r, c)
-
+pyautogui.PAUSE = 0.01  # минимальная пауза между действиями
 def click(area, row, col, right_click=False, CELL_SIZE=20):
     x_center = area[0] + col * CELL_SIZE + CELL_SIZE // 2
     y_center = area[1] + row * CELL_SIZE + CELL_SIZE // 2
@@ -413,8 +856,6 @@ def select_game_area():
 def start_game(area, *args):
     try:
         print("Область выбрана для игры:", area)
-
-
         # Автоопределение размера ячейки
         board_width = area[2] - area[0]
         board_height = area[3] - area[1]
@@ -432,7 +873,20 @@ def start_game(area, *args):
         thread = threading.Thread(target=start_solver, daemon=True)
         thread.start()
     except ValueError:
-        print("Ошибка ввода. Пожалуйста, введите корректные значения.")
+        print(f"{ERROR}Ошибка ввода. Пожалуйста, введите корректные значения.{RESET}")
+
+def start_game_auto():
+    try:
+        board_width_count = int(width_entry.get())
+        board_height_count = int(height_entry.get())
+        CELL_SIZE = detect_cell_size()
+        area = find_minesweeper_field(board_width_count, board_height_count, CELL_SIZE)
+        # area = find_game_board()
+        print(f"{SUCCESS}Область выбрана для игры:{area}{RESET}")
+        start_game(area)
+
+    except Exception as e:
+        print(f"{ERROR}[ERROR] Ошибка запуска игры: {e}{RESET}")
 
 def analyze_cell_color(area, *args):
     screenshot = ImageGrab.grab(bbox=area)
@@ -455,28 +909,43 @@ def update_gui_color(rgb):
     color_label.config(bg=hex_color)
     color_value.config(text=f"RGB{tuple(rgb)}")
 
-def show_unknown_color_dialog(rgb_color):
+def show_unknown_color_dialog(cell_img):
     dialog = tk.Toplevel(root)
-    dialog.title("Неизвестный цвет")
-    dialog.geometry("300x150")
+    dialog.title("Неизвестная ячейка")
+    dialog.geometry("400x600")
     dialog.transient(root)
     dialog.grab_set()
 
-    hex_color = '#%02x%02x%02x' % tuple(rgb_color)
+    tk.Label(dialog, text="Обнаружена неопределённая ячейка:", font=("Arial", 12)).pack(pady=5)
 
-    tk.Label(dialog, text="Обнаружен неизвестный цвет:", font=("Arial", 12)).pack(pady=5)
-    color_label = tk.Label(dialog, text=f"RGB{rgb_color}", bg=hex_color, width=20, height=2, relief="solid")
-    color_label.pack(pady=5)
+    # Конвертируем в PhotoImage для отображения в Tkinter
+    img_tk = ImageTk.PhotoImage(cell_img.resize((60, 60)))
+    panel = tk.Label(dialog, image=img_tk)
+    panel.image = img_tk  # ← ВАЖНО! Сохраняем ссылку на изображение
+    panel.pack(pady=5)
 
-    tk.Label(dialog, text="Нажмите 'ОК', чтобы продолжить").pack(pady=5)
+    tk.Label(dialog, text="Выберите тип ячейки или закройте окно").pack(pady=5)
 
     def resume():
         dialog.destroy()
         global pause_solver
-        pause_solver = False  # Возобновляем работу решателя
+        pause_solver = False
 
-    tk.Button(dialog, text="Продолжить", command=resume).pack(pady=5)
+    def add_template(label):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join("templates", f"{label}_{timestamp}.png")
+        cell_img.save(path)
+        print(f"[ACTION] Сохранён новый шаблон: {label}_{timestamp}.png")
+        load_templates()  # Обновляем шаблоны
+        resume()
 
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(pady=10)
+
+    for label in ['X', 'F', '0', '1', '2', '3', '4', '5', '6', '7', '8']:
+        tk.Button(btn_frame, text=label, width=3, command=lambda l=label: add_template(l)).pack(side='left', padx=2)
+
+    tk.Button(dialog, text="Выход", width=10, command=lambda: dialog.destroy()).pack(pady=5)
     root.wait_window(dialog)
 
 def show_uncnown_mine_dialog():
@@ -514,6 +983,8 @@ def listen_for_escape():
 # ==============================
 
 if __name__ == "__main__":
+
+    load_templates()
     root = tk.Tk()
     root.title("Сапёр: Цветовой анализатор")
     root.geometry("400x400")
@@ -529,13 +1000,13 @@ if __name__ == "__main__":
     global width_entry
     width_entry = tk.Entry(settings_frame, width=10)
     width_entry.grid(row=0, column=1, padx=5, pady=5)
-    width_entry.insert(0, "10")
+    width_entry.insert(0, "9")
 
     tk.Label(settings_frame, text="Высота поля:", width=15, anchor='w').grid(row=1, column=0, padx=5, pady=5)
     global height_entry
     height_entry = tk.Entry(settings_frame, width=10)
     height_entry.grid(row=1, column=1, padx=5, pady=5)
-    height_entry.insert(0, "10")
+    height_entry.insert(0, "9")
 
     tk.Label(settings_frame, text="Количество мин:", width=15, anchor='w').grid(row=2, column=0, padx=5, pady=5)
     global mines_entry
@@ -552,6 +1023,9 @@ if __name__ == "__main__":
 
     tk.Button(btn_frame, text="Играть", width=25, command=select_game_area).grid(
         row=1, column=0, padx=5, pady=5)
+
+    tk.Button(btn_frame, text="Автопоиск поля", width=25, command=start_game_auto).grid(
+        row=2, column=0, padx=5, pady=5)
 
     # Отображение цвета
     global color_label, color_value
