@@ -15,6 +15,9 @@ import pytesseract
 from computer_vision import find_minesweeper_field
 import os
 from datetime import datetime
+import queue
+from collections import defaultdict
+from functools import partial
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 TEMPLATES_DIR = "templates"
@@ -38,11 +41,17 @@ COLOR_MAP = {
     'F': '\033[91m',   # Красный
     'X': '\033[30m',   # Чёрный
     '?': '\033[93m',  # Жёлтый (неопределённая ячейка)
+    'C': '\033[93m',  # Жёлтый
+    'M': '\033[94m',   # Ярко-синий
 }
 RESET = '\033[0m'
 SUCCESS = '\033[92m'
 ERROR = '\033[91m'
 WARNING = '\033[93m'
+
+board_changes = queue.Queue()
+current_board = None
+board_lock = threading.Lock()
 
 def load_templates():
     """
@@ -78,7 +87,7 @@ def load_templates():
                     if base_label not in templates:
                         templates[base_label] = []
                     templates[base_label].append(img)
-                    print(f"[INFO] Шаблон загружен: {base_label}")
+                    # print(f"[INFO] Шаблон загружен: {base_label}")
                 except Exception as e:
                     print(f"[ERROR] Неверное имя файла: {filename} | {e}")
             else:
@@ -101,8 +110,8 @@ def print_colored_board(board):
         '?': '\033[93m',  # Жёлтый (неопределённая ячейка)
     }
     RESET = '\033[0m'
-    def print_colored_board(board):
-        print("\n[DEBUG] Текущее состояние доски:")
+
+    print("\n[DEBUG] Текущее состояние доски:")
     for row in board:
         line = ""
         for cell in row:
@@ -195,8 +204,8 @@ def cell_color_to_type(cell_img):
                      (107, 105, 41),
                      (117, 122, 46),
                      (116, 109, 44),
-                     (50, 129, 166),
-                     (180, 146, 62),
+
+
                      (80, 128, 157),
                      (38, 111, 154),
                      (129, 113, 31)],
@@ -205,12 +214,15 @@ def cell_color_to_type(cell_img):
                      (160, 130, 89),
                      (202, 143, 135),
                      (107, 123, 41)],
-        '1':        [(94, 98, 44)],
-        '2':        [(113, 115, 36)],
+        'C':        [(180, 146, 62)],
+        'M':        [(50, 129, 166)],
+        # '1':        [(1, 1, 1)], #(94, 98, 44)
+        # '2':        [(113, 115, 36)],
         '3':        [(116, 97, 26)],
         '4':        [(118, 81, 25)],
         '5':        [(122, 61, 23)],
         '6':        [(128, 53, 21)],
+        '7':        [(133, 37, 26)],
     }
 
 
@@ -227,28 +239,14 @@ def cell_color_to_type(cell_img):
                 min_dist = dist
                 closest_type = label
 
-    if min_dist > 300:  # Можно настроить порог
-        print(f"[DEBUG] Неопределённая ячейка | Цвет: {avg_color}, дистанция: {min_dist}")
-        return cell_ocr_to_type(cell_img)
-        show_unknown_color_dialog(cell_img)
-        return 'X'
+    if min_dist > 100:  # Можно настроить порог
+        # print(f"[DEBUG] Неопределённая ячейка | Цвет: {avg_color}, дистанция: {min_dist}")
+        # return cell_ocr_to_type(cell_img)
+        # show_unknown_color_dialog(cell_img)
+        return '?'
     color_code = COLOR_MAP.get(closest_type, RESET)
-    print(f"[DEBUG][COLOR] Ячейка распознана как: {color_code}{closest_type}{RESET} (дистанция: {min_dist}) | Цвет: {avg_color}")
+    # print(f"[DEBUG][COLOR] Ячейка распознана как: {color_code}{closest_type}{RESET} (дистанция: {min_dist}) | Цвет: {avg_color}")
     return closest_type
-
-def preprocess(img):
-    # Градации серого
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-
-    # Повышаем резкость
-    sharpen_kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
-    sharpened = cv2.filter2D(gray, -1, sharpen_kernel)
-
-    # Улучшаем контраст
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(sharpened)
-
-    return enhanced
 
 def cell_template_to_type(cell_img):
     global pause_solver, stop_solver
@@ -259,7 +257,7 @@ def cell_template_to_type(cell_img):
     pad_w, pad_h = int(w * 0.1), int(h * 0.1)  # 5% от края
     center = gray_cell[pad_h:h - pad_h, pad_w:w - pad_w]  # Центральная область (90%)
 
-    best_label = 'X'
+    best_label = '?'
     best_score = 0.0
 
     for label, template_list in templates.items():
@@ -278,11 +276,11 @@ def cell_template_to_type(cell_img):
 
     CONFIDENCE_THRESHOLD = 0.8
     if best_score < CONFIDENCE_THRESHOLD:
-        print(f"[DEBUG] Неопределённая ячейка | Дистанция: {best_score:.2f}")
+        # print(f"[DEBUG] Неопределённая ячейка | Дистанция: {best_score:.2f}")
         return cell_color_to_type(cell_img)
         show_unknown_color_dialog(cell_img)
     color_code = COLOR_MAP.get(best_label, RESET)
-    print(f"[DEBUG][TEMPLATE] Ячейка распознана как: {color_code}{best_label}{RESET} (score={best_score:.2f})")
+    # print(f"[DEBUG][TEMPLATE] Ячейка распознана как: {color_code}{best_label}{RESET} (score={best_score:.2f})")
     return best_label
 
 def cell_ocr_to_type(cell_img):
@@ -322,7 +320,7 @@ def cell_ocr_to_type(cell_img):
     else:
         print(f"[DEBUG] OCR не смог распознать число: '{text}'")
         # show_unknown_color_dialog(cell_img)
-        return 'X'
+        return '?'
 # ==============================
 # = Распознавание игрового поля =
 # ==============================
@@ -412,6 +410,32 @@ def detect_cell_size(template_path='templates/X_dota.png'):
     print(f"[INFO] Размер ячейки определён: {cell_size}x{cell_size}")
     return cell_size
 
+def find_and_click_image(template_file, threshold=0.8):
+    template_path = os.path.join(TEMPLATES_DIR, template_file)
+    template = cv2.imread(template_path, cv2.IMREAD_UNCHANGED)
+    if template is None:
+        print(f"[ERROR] Не удалось загрузить изображение: {template_path}")
+        return False
+
+    if template.shape[2] == 4:
+        template = cv2.cvtColor(template, cv2.COLOR_BGRA2BGR)
+
+    screenshot = pyautogui.screenshot()
+    screen = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+
+    result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
+    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+
+    if max_val >= threshold:
+        h, w = template.shape[:2]
+        center_x = max_loc[0] + w // 2
+        center_y = max_loc[1] + h // 2
+        return center_x, center_y
+    else:
+        print("Элемент не найден.")
+        return False
+
+
 def find_minesweeper_field(board_width_count, board_height_count, CELL_SIZE, template_dir=os.path.join(TEMPLATES_DIR, "fields"), threshold=0.9):
     """
    Перебирает несколько шаблонов игрового поля и возвращает первую найденную область
@@ -458,61 +482,73 @@ def find_minesweeper_field(board_width_count, board_height_count, CELL_SIZE, tem
     print("[INFO] Поле Сапёра не найдено")
     return None
 
-
-
-
-# def find_minesweeper_field(template_path='templates/field_template.png', threshold=0.95):
-#     """
-#     Ищет область игрового поля Сапёра на экране.
-#
-#     :param template_path: путь к шаблону поля
-#     :param threshold: порог совпадения
-#     :return: координаты найденной области (x1, y1, x2, y2) или None
-#     """
-#
-#     # Загрузка шаблона
-#     if not os.path.exists(template_path):
-#         print(f"[ERROR] Шаблон не найден: {template_path}")
-#         return None
-#
-#     template = cv.imread(template_path)
-#     template_gray = cv.cvtColor(template, cv.COLOR_BGR2GRAY)
-#     tw, th = template_gray.shape[::-1]
-#
-#     # Делаем скриншот всего экрана
-#     screen_img = ImageGrab.grab()
-#     screen_array = np.array(screen_img)
-#     screen_gray = cv.cvtColor(screen_array, cv.COLOR_BGR2GRAY)
-#
-#     # Поиск шаблона
-#     res = cv.matchTemplate(screen_gray, template_gray, cv.TM_CCOEFF_NORMED)
-#     loc = np.where(res >= threshold)
-#
-#     matches = list(zip(*loc[::-1]))
-#
-#     if not matches:
-#         print("[INFO] Поле Сапёра не найдено")
-#         return None
-#
-#     # Берём первое совпадение как основное
-#     top_left = matches[0]
-#     bottom_right = (top_left[0] + tw, top_left[1] + th)
-#
-#     print(f"[SUCCESS] Найдено игровое поле: {top_left} → {bottom_right}")
-#
-#     # Визуализация результата (опционально)
-#     result_img = screen_array.copy()
-#     cv.rectangle(result_img, top_left, bottom_right, (0, 0, 255), 2)
-#     cv.imshow("Found Field", result_img)
-#     cv.waitKey(1000)
-#     cv.destroyAllWindows()
-#
-#     return (*top_left, *bottom_right)
-
-
 # ==============================
 # === Работа с игровым полем ==
 # ==============================
+def analyze_board_worker(area, cell_size, total_mines):
+    """Поток для непрерывного анализа доски"""
+    global current_board, stop_solver
+    last_board = None
+
+    while not stop_solver:
+        if pause_solver:
+            time.sleep(1)
+            continue
+
+        try:
+            # Получаем текущее состояние доски
+            correct_board = True
+
+            with board_lock:
+                if last_board:
+                    board = analyze_board(area, cell_size)
+                    for r in range(len(board)):
+                        for c in range(len(board[0])):
+                            old_val = last_board[r][c]
+                            new_val = board[r][c]
+                            if new_val == '?':
+                                correct_board = False
+                                break
+                        if not correct_board:
+                            break
+                else:
+                    board = analyze_board(area, cell_size)
+            if not correct_board:
+                print(f"[INFO] Не все ячейки распознаны, пропускаем кадр")
+                continue
+            current_board = board
+
+
+            # Определяем изменения
+            if last_board and board != last_board:
+                changes = find_board_changes(last_board, board)
+                if changes:
+                    board_changes.put(changes)
+
+            last_board = [row[:] for row in board]  # Глубокая копия
+            time.sleep(0.2)
+
+        except Exception as e:
+            print(f"[ERROR] В потоке анализа: {str(e)}")
+            time.sleep(1)
+
+def find_board_changes(old_board, new_board):
+    """Находит изменения между двумя состояниями доски"""
+    changes = defaultdict(list)
+
+    for row in range(len(old_board)):
+        for col in range(len(old_board[0])):
+            old_val = old_board[row][col]
+            new_val = new_board[row][col]
+
+            if old_val != new_val:
+                if new_val == '?':
+                    changes[(row, col)] = (old_val, old_val)
+                changes[(row, col)] = (old_val, new_val)
+
+    return dict(changes)
+
+
 def analyze_board(area, cell_size):
     global stop_solver
     board_image = ImageGrab.grab(bbox=area)
@@ -601,14 +637,23 @@ def get_cell_real_count_mines(board, total_mines=0):
 def find_cells_with_known_mines(board):
     mandatory_mines = []
     safe_cells = []
-
+    safe_clocked = []
+    error_flagged = False
+    is_cloacked = False
     number_cells = []
+    safe_mana = []
+
 
     for row in range(len(board)):
         for col in range(len(board[0])):
             if board[row][col].isdigit() and board[row][col] != '0':
                 count = int(board[row][col])
                 neighbors = get_neighbors(board, row, col)
+                none = [n for n in neighbors if board[n[0]][n[1]] == '?']
+                mana = [n for n in neighbors if board[n[0]][n[1]] == 'M']
+                cloacked = [n for n in neighbors if board[n[0]][n[1]] == 'C']
+                if cloacked:
+                    is_cloacked = True
                 flagged = [n for n in neighbors if board[n[0]][n[1]] == 'F']
                 unknown = [n for n in neighbors if board[n[0]][n[1]] == 'X']
                 remaining = count - len(flagged)
@@ -617,40 +662,69 @@ def find_cells_with_known_mines(board):
                     'count': count,
                     'flagged': flagged,
                     'unknown': unknown,
-                    'remaining': remaining
+                    'remaining': remaining,
+                    'cloacked': cloacked,
+                    'mana': mana,
+                    'none': none
                 })
 
     # === ОДИНОЧНАЯ ОБРАБОТКА ЧИСЕЛ ===
 
     for data in number_cells:
+        if data['none']:
+            continue
         move = False
         unknown = data['unknown']
+        cloacked = data['cloacked']
         flagged = data['flagged']
         count = data['count']
+        mana = data['mana']
         # print(f"[SOLO] Анализируем ячейку {data['pos']}")
         # print(f"   └── Неизвестные: {unknown}")
         # print(f"   └── Нужно мин: {count}")
         # print(f"   └── Помечено мин: {flagged}")
+
+        # if is_cloacked and not cloacked:
+        #     continue
+
+        if count < len(flagged):
+            for r, c in flagged:
+                mandatory_mines.append((r, c))
+            print(f"[SOLO] Случай 0: поставлены лишние флаги. Снимаем их {flagged}")
+            error_flagged = True
+            continue
+        if error_flagged:
+            break
+
         # Случай 1: Все флаги уже поставлены → открываем остальные
         if count == len(flagged):
+            for r, c in cloacked:
+                safe_clocked.append((r, c))
+
+            for r, c in mana:
+                safe_mana.append((r, c))
+
             for r, c in unknown:
                 safe_cells.append((r, c))
-                # print(f"[SOLO] Открываем ячейку {r, c}")
-                move = True
-                # break  # Выходим из цикла и обновляем доску
+                # move = True
 
         # Случай 2: Осталось ровно столько мин → ставим флаги
-        elif count == len(flagged) + len(unknown):
+        elif count == len(flagged) + len(unknown) + len(cloacked) + len(mana):
+            for r, c in cloacked:
+                mandatory_mines.append((r, c))
+                # move = True
+
             for r, c in unknown:
                 mandatory_mines.append((r, c))
-                # print(f"[SOLO] Помечаем ячейку {r, c} миной")
-                move = True
-                # break  # Выходим из цикла и обновляем доску
-    return list(set(mandatory_mines)), list(set(safe_cells))
+                # move = True
+
+    return list(set(mandatory_mines)), list(set(safe_cells)), list(set(safe_clocked)), list(set(safe_mana))
 
 def find_safe_cells(board, total_mines=0):
     mandatory_mines = []
+    safe_clocked = []
     safe_cells = []
+    safe_mana = []
     end = False
 
     number_cells = []
@@ -660,54 +734,63 @@ def find_safe_cells(board, total_mines=0):
             if board[row][col].isdigit() and board[row][col] != '0':
                 count = int(board[row][col])
                 neighbors = get_neighbors(board, row, col)
+                none = [n for n in neighbors if board[n[0]][n[1]] == '?']
+                mana = [n for n in neighbors if board[n[0]][n[1]] == 'M']
+                cloacked = [n for n in neighbors if board[n[0]][n[1]] == 'C']
                 flagged = [n for n in neighbors if board[n[0]][n[1]] == 'F']
-                unknown = [n for n in neighbors if board[n[0]][n[1]] == 'X']
+                unknown = [n for n in neighbors if board[n[0]][n[1]] == 'X' or board[n[0]][n[1]] == 'C' or board[n[0]][n[1]] == 'M']
                 remaining = count - len(flagged)
                 number_cells.append({
                     'pos': (row, col),
                     'count': count,
                     'flagged': flagged,
                     'unknown': unknown,
-                    'remaining': remaining
+                    'remaining': remaining,
+                    'cloacked': cloacked,
+                    'mana': mana,
+                    'none': none
                 })
 
 
     # Перебираем все пары чисел
     for i in range(len(number_cells)):
         data1 = number_cells[i]
+        if data1['none']:
+            continue
         for j in range(i + 1, len(number_cells)):
             data2 = number_cells[j]
-
+            if data2['none']:
+                continue
             common = set(data1['unknown']) & set(data2['unknown'])
             all_unknown = set(data1['unknown']) | set(data2['unknown'])
             if not common:
                 continue
 
-            print(f"[GROUP] Сравниваем {data1['pos']} и {data2['pos']}")
-            print(f"   └── Общие неизвестные: {common}")
-            print(f"   └── Всё неизвестные: {all_unknown}")
-            print(f"   └── Нужно мин: {data1['remaining']}, {data2['remaining']}")
+            # print(f"[GROUP] Сравниваем {data1['pos']} и {data2['pos']}")
+            # print(f"   └── Общие неизвестные: {common}")
+            # print(f"   └── Всё неизвестные: {all_unknown}")
+            # print(f"   └── Нужно мин: {data1['remaining']}, {data2['remaining']}")
 
 
             # === Случай 1: все ячейки кроме общих — безопасны  ===
             if (data1['remaining'] + data2['remaining'] == len(common) and
                     (len(data1['unknown']) == len(common) or len(data2['unknown']) == len(common)) and
                     len(all_unknown) > len(common)):
-                print("   ✅ Все ячейки кроме общих — безопасны")
+                # print("   ✅ Все ячейки кроме общих — безопасны")
                 safe_cells.extend(all_unknown - common)
 
             # === Случай 2: число мин меньше количества общих ячеек ===
             elif ((len(data1['unknown']) == len(common) or len(data2['unknown']) == len(common)) and
                   (data1['remaining'] + data2['remaining'] == len(all_unknown)) and len(all_unknown) > len(common)):
                 mandatory_mines.extend(all_unknown - common)
-                print(f"   ✅ Нужно пометить {all_unknown - common} как мины")
+                # print(f"   ✅ Нужно пометить {all_unknown - common} как мины")
 
             else:
                 real_count_mines = get_cell_real_count_mines(board, total_mines)
                 print(f"   └── количество мин: {real_count_mines}")
                 if len(common) == real_count_mines and data1['remaining'] == data2['remaining'] == real_count_mines:
                     mandatory_mines.extend(common)
-                    print(f"   ✅ Ячейка {common} — единственная возможная мина")
+                    # print(f"   ✅ Ячейка {common} — единственная возможная мина")
                     end = True
 
             if end:
@@ -715,7 +798,7 @@ def find_safe_cells(board, total_mines=0):
         if end:
             break
 
-    return list(set(mandatory_mines)), list(set(safe_cells))
+    return list(set(mandatory_mines)), list(set(safe_cells)), list(set(safe_clocked)), list(set(safe_mana))
 
 def solve_minesweeper(area, cell_size=20, total_mines=10):
     global stop_solver
@@ -723,25 +806,102 @@ def solve_minesweeper(area, cell_size=20, total_mines=10):
     stop_solver = False
     start_time = time.time()  # ← запоминаем время старта
 
+    # Запускаем поток для анализа доски
+    analyzer_thread = threading.Thread(
+        target=analyze_board_worker,
+        args=(area, cell_size, total_mines),
+        daemon=True
+    )
+    analyzer_thread.start()
+
     # Запускаем прослушивание Esc в отдельном потоке
     escape_thread = threading.Thread(target=listen_for_escape, daemon=True)
     escape_thread.start()
 
     try:
-        while True:
+        update_time = 2
+        changes = {(0, 0)}
+        last_board = []
+        max_retries = 10
+        retry_count = 0
+        board = None
+        
+        while not stop_solver:
+            time.sleep(0.1)
             if pause_solver:
                 print("[INFO] Решатель приостановлен. Ожидание...")
                 while pause_solver:
                     time.sleep(0.5)
                 print("[INFO] Продолжаю выполнение...")
                 continue
-            board = analyze_board(area, cell_size)
-            # Проверяем, не закончилась ли игра
+
+            # Получаем текущее состояние доски
+            with board_lock:
+                if board == current_board:
+                    move_mouse_relative()
+                    retry_count += 1
+                    time.sleep(0.25)
+                    if retry_count >= max_retries:
+                        print(f"[ERROR] Превышено количество попыток ({max_retries}) при обнаружении изменений. Прерываю выполнение...")
+                        if find_and_click_image("game_over/win.png"):
+                            x, y = find_and_click_image("game_over/win.png")
+                            click_to(x, y)
+                            time.sleep(0.1)
+                            click_to(x, y)
+                            press_f9()
+                            end_time = time.time()
+                            elapsed = end_time - start_time
+                            print(f"{SUCCESS}[SUCCESS] Игра решена за {int(elapsed)} секунд{RESET}")
+                            break
+                        elif find_and_click_image("game_over/failed.png"):
+                            end_time = time.time()
+                            elapsed = end_time - start_time
+                            print(f"{ERROR}[ERROR] Игра проиграна за {int(elapsed)} секунд{RESET}")
+                            break
+                        else:
+                            retry_count = 0
+                            pause_solver = True
+                            show_unknown_mine_message(True)
+                    # print("[INFO] Доска не изменилась. Пропускаем кадр...")
+                    continue
+                else:
+                    retry_count = 0
+
+
+
+                board = [row[:] for row in current_board] if current_board else None
+
+            if not board:
+                time.sleep(0.5)
+                continue
+
             if is_game_over(board, total_mines):
-                end_time = time.time()
-                elapsed = end_time - start_time
-                print(f"{SUCCESS}[SUCCESS] Игра решена за {int(elapsed)} секунд{RESET}")
-                break
+                time.sleep(3)
+                if find_and_click_image("game_over/win.png"):
+                    x, y = find_and_click_image("game_over/win.png")
+                    click_to(x, y)
+                    time.sleep(0.1)
+                    click_to(x, y)
+                    press_f9()
+                    end_time = time.time()
+                    elapsed = end_time - start_time
+                    print(f"{SUCCESS}[SUCCESS] Игра решена за {int(elapsed)} секунд{RESET}")
+                    break
+
+            retry_count = 0
+
+            last_board = [row[:] for row in board]  # Глубокая копия
+
+            # Проверяем изменения
+            try:
+                changes = board_changes.get_nowait()
+                print("[INFO] Обнаружены изменения на доске:")
+                for (r, c), (old, new) in changes.items():
+                    print(f"  [{r}][{c}]: {old} → {new}")
+            except queue.Empty:
+                pass
+
+
 
             print_colored_board(board)
 
@@ -749,42 +909,81 @@ def solve_minesweeper(area, cell_size=20, total_mines=10):
 
             # === Анализ обязательных мин ===
             if not made_move:
-                mandatory_mines, safe_cells = find_cells_with_known_mines(board)
+                mandatory_mines, safe_cells, safe_clocked, safe_mana = find_cells_with_known_mines(board)
+                print(f"[ACTION][SOLO] Найдены обязательные мины: {mandatory_mines}")
+
+                if safe_clocked:
+                    print("[ACTION][SOLO] Найдены безопасные ячейки с часиками:")
+                    for r, c in safe_clocked:
+                        print(f"Часы на [{r}][{c}]")
+                        click(area, r, c, right_click=False, CELL_SIZE=cell_size)
+                        # time.sleep(0.1)
+                        # break
+                    made_move = True
+
+                if safe_mana:
+                    print("[ACTION][SOLO] Найдены безопасные ячейки с маной:")
+                    for r, c in safe_mana:
+                        print(f"Мана на [{r}][{c}]")
+                        click(area, r, c, right_click=False, CELL_SIZE=cell_size)
+                        # time.sleep(0.1)
+                        # break
+                    made_move = True
 
                 if mandatory_mines:
-                    print("[ACTION] Найдены обязательные мины:")
+                    print("[ACTION][SOLO] Найдены обязательные мины:")
                     for r, c in mandatory_mines:
                         print(f"Флаг на [{r}][{c}]")
                         click(area, r, c, right_click=True, CELL_SIZE=cell_size)
-                        time.sleep(0.1)
+                    time.sleep(0.8)
                     made_move = True
 
                 if safe_cells:
-                    print("[ACTION] Найдены безопасные ячейки:")
+                    print("[ACTION][SOLO] Найдены безопасные ячейки:")
                     for r, c in safe_cells:
                         print(f"Открытие [{r}][{c}]")
                         click(area, r, c, right_click=False, CELL_SIZE=cell_size)
-                        time.sleep(0.1)
+                        # time.sleep(0.1)
+                        # break
                     made_move = True
 
 
             if not made_move:
-                mandatory_mines, safe_cells = find_safe_cells(board, total_mines)
+                mandatory_mines, safe_cells, safe_clocked, safe_mana = find_safe_cells(board, total_mines)
+                print(f"[ACTION][GROUP] Найдены обязательные мины: {mandatory_mines}")
+                if safe_clocked:
+                    ptint("[ACTION][GROUP] Найдены безопасные ячейки с часиками:")
+                    for r, c in safe_clocked:
+                        print(f"Часы на [{r}][{c}]")
+                        click(area, r, c, right_click=False, CELL_SIZE=cell_size)
+                        # time.sleep(0.1)
+                        # break
+                    made_move = True
+
+                if safe_mana:
+                    print("[ACTION][GROUP] Найдены безопасные ячейки с маной:")
+                    for r, c in safe_mana:
+                        print(f"Мана на [{r}][{c}]")
+                        click(area, r, c, right_click=False, CELL_SIZE=cell_size)
+                        # time.sleep(0.1)
+                        # break
+                    made_move = True
 
                 if mandatory_mines:
-                    print("[ACTION] Найдены обязательные мины:")
+                    print("[ACTION][GROUP] Найдены обязательные мины:")
                     for r, c in mandatory_mines:
                         print(f"Флаг на [{r}][{c}]")
                         click(area, r, c, right_click=True, CELL_SIZE=cell_size)
-                        time.sleep(0.1)
+                    time.sleep(0.8)
                     made_move = True
 
                 if safe_cells:
-                    print("[ACTION] Найдены безопасные ячейки:")
+                    print("[ACTION][GROUP] Найдены безопасные ячейки:")
                     for r, c in safe_cells:
                         print(f"Открытие [{r}][{c}]")
                         click(area, r, c, right_click=False, CELL_SIZE=cell_size)
-                        time.sleep(0.1)
+                        # time.sleep(0.1)
+                        # break
                     made_move = True
 
             if not made_move:
@@ -808,23 +1007,62 @@ def solve_minesweeper(area, cell_size=20, total_mines=10):
                         click(area, r, c, right_click=False, CELL_SIZE=cell_size)
                         # time.sleep(0.1)
                         made_move = True
-                        break  # После одного клика обновляем доску
+                        # break  # После одного клика обновляем доску
 
             if not made_move:
                 print(f"{WARNING}[INFO] Нет явных ходов. Предоставляется выбор пользователю...{RESET}")
                 pause_solver = True
-                show_uncnown_mine_dialog()
+                show_unknown_mine_message(True)
 
 
             if stop_solver:
                 print("[INFO] Прерывание по ESC.")
                 break
 
-        time.sleep(1)
+
+
+        if changes == {}:
+            end_time = time.time()
+            elapsed = end_time - start_time
+            print(f"{WARNING}[WARNING] Игра завершена за {int(elapsed)} секунд{RESET}")
+
 
     except KeyboardInterrupt:
         print("Решатель остановлен пользователем.")
+    finally:
+        stop_solver = True
+        analyzer_thread.join(timeout=1)
+        escape_thread.join(timeout=1)
+        print("[INFO] Все потоки остановлены")
+
+
 pyautogui.PAUSE = 0.01  # минимальная пауза между действиями
+
+def press_f9(delay=0.1):
+    """
+    Имитирует нажатие и отпускание клавиши F9
+
+    :param delay: задержка между нажатием и отжатием (в секундах)
+    """
+    print("[INFO] Нажимаю F9...")
+    pyautogui.keyDown('f9')   # Зажать F9
+    time.sleep(delay)
+    pyautogui.keyUp('f9')     # Отпустить F9
+    print("[INFO] F9 отжата")
+
+def move_mouse_relative(dx=40, dy=40):
+    x, y = pyautogui.position()
+    pyautogui.move(dx, dy)
+    print(f"Перемещаем курсор на {dx}x{dy} = {x + dx}x{y + dy}")
+    return
+
+def click_to(x, y):
+    pyautogui.moveTo(x, y)
+    pyautogui.mouseDown(button='left')
+    time.sleep(0.005)
+    pyautogui.mouseUp(button='left')
+
+
 def click(area, row, col, right_click=False, CELL_SIZE=20):
     x_center = area[0] + col * CELL_SIZE + CELL_SIZE // 2
     y_center = area[1] + row * CELL_SIZE + CELL_SIZE // 2
@@ -840,7 +1078,7 @@ def click(area, row, col, right_click=False, CELL_SIZE=20):
         time.sleep(0.005)
         pyautogui.mouseUp(button='left')
 
-    print(f"[DEBUG] {'Правый' if right_click else 'Левый'} клик по [{row}][{col}]")
+    # print(f"[DEBUG] {'Правый' if right_click else 'Левый'} клик по [{row}][{col}]")
 
 # ==============================
 # === Диалоги и взаимодействие
@@ -853,7 +1091,7 @@ def select_game_area():
     print("Выберите область игрового поля...")
     AreaSelectorApp(start_game).run()
 
-def start_game(area, *args):
+def start_game(area, total_mines, CELL_SIZE=36, *args):
     try:
         print("Область выбрана для игры:", area)
         # Автоопределение размера ячейки
@@ -861,9 +1099,9 @@ def start_game(area, *args):
         board_height = area[3] - area[1]
         board_width_count = int(width_entry.get())
         board_height_count = int(height_entry.get())
-        total_mines = int(mines_entry.get())
-        CELL_SIZE = min(board_width // board_width_count, board_height // board_height_count)
-        print(f"Определённый размер ячейки: {CELL_SIZE}")
+        # total_mines = int(mines_entry.get())
+        # CELL_SIZE = min(board_width // board_width_count, board_height // board_height_count)
+        # print(f"Определённый размер ячейки: {CELL_SIZE}")
 
         print("Запускаю решатель...")
         def start_solver():
@@ -875,15 +1113,27 @@ def start_game(area, *args):
     except ValueError:
         print(f"{ERROR}Ошибка ввода. Пожалуйста, введите корректные значения.{RESET}")
 
-def start_game_auto():
+def start_game_auto(board_width_count = 9, board_height_count = 9, total_mines = 10):
+    try:
+        # board_width_count = int(width_entry.get())
+        # board_height_count = int(height_entry.get())
+        CELL_SIZE = detect_cell_size()
+        area = find_minesweeper_field(board_width_count, board_height_count, CELL_SIZE)
+        print(f"{SUCCESS}Область выбрана для игры:{area}{RESET}")
+        start_game(area, total_mines, CELL_SIZE)
+
+    except Exception as e:
+        print(f"{ERROR}[ERROR] Ошибка запуска игры: {e}{RESET}")
+
+def start_game_auto_default():
     try:
         board_width_count = int(width_entry.get())
         board_height_count = int(height_entry.get())
+        total_mines = int(mines_entry.get())
         CELL_SIZE = detect_cell_size()
         area = find_minesweeper_field(board_width_count, board_height_count, CELL_SIZE)
-        # area = find_game_board()
         print(f"{SUCCESS}Область выбрана для игры:{area}{RESET}")
-        start_game(area)
+        start_game(area, total_mines, CELL_SIZE)
 
     except Exception as e:
         print(f"{ERROR}[ERROR] Ошибка запуска игры: {e}{RESET}")
@@ -942,11 +1192,23 @@ def show_unknown_color_dialog(cell_img):
     btn_frame = tk.Frame(dialog)
     btn_frame.pack(pady=10)
 
-    for label in ['X', 'F', '0', '1', '2', '3', '4', '5', '6', '7', '8']:
+    for label in ['X', 'F', 'C', 'M', '0', '1', '2', '3', '4', '5', '6', '7', '8']:
         tk.Button(btn_frame, text=label, width=3, command=lambda l=label: add_template(l)).pack(side='left', padx=2)
 
     tk.Button(dialog, text="Выход", width=10, command=lambda: dialog.destroy()).pack(pady=5)
     root.wait_window(dialog)
+
+def show_unknown_mine_message(show=True):
+    if show:
+        message_frame.pack(pady=10)  # Показываем сообщение
+    else:
+        message_frame.pack_forget()  # Скрываем сообщение
+
+def resume_solver():
+    global pause_solver
+    pause_solver = False
+    show_unknown_mine_message(False)  # Скрываем сообщение
+    print("Решатель продолжает работу...")
 
 def show_uncnown_mine_dialog():
     dialog = tk.Toplevel(root)
@@ -987,7 +1249,7 @@ if __name__ == "__main__":
     load_templates()
     root = tk.Tk()
     root.title("Сапёр: Цветовой анализатор")
-    root.geometry("400x400")
+    root.geometry("400x800")
     root.resizable(False, False)
 
     tk.Label(root, text="Сапёр: Анализ цветов", font=("Arial", 16)).pack(pady=10)
@@ -1024,8 +1286,43 @@ if __name__ == "__main__":
     tk.Button(btn_frame, text="Играть", width=25, command=select_game_area).grid(
         row=1, column=0, padx=5, pady=5)
 
-    tk.Button(btn_frame, text="Автопоиск поля", width=25, command=start_game_auto).grid(
+    tk.Button(btn_frame, text="Автопоиск поля", width=25, command=start_game_auto_default).grid(
         row=2, column=0, padx=5, pady=5)
+
+    start_game_auto_9x9 = partial(start_game_auto, 9, 9, 10)
+    tk.Button(btn_frame, text="9x9", width=25, command=start_game_auto_9x9).grid(
+        row=3, column=0, padx=5, pady=5)
+
+    start_game_auto_12x11 = partial(start_game_auto, 12, 11, 19)
+    tk.Button(btn_frame, text="12x11", width=25, command=start_game_auto_12x11).grid(
+        row=4, column=0, padx=5, pady=5)
+
+    start_game_auto_15x13 = partial(start_game_auto, 15, 13, 32)
+    tk.Button(btn_frame, text="15x13", width=25, command=start_game_auto_15x13).grid(
+        row=5, column=0, padx=5, pady=5)
+
+    start_game_auto_18x14 = partial(start_game_auto, 18, 14, 47)
+    tk.Button(btn_frame, text="18x14", width=25, command=start_game_auto_18x14).grid(
+        row=6, column=0, padx=5, pady=5)
+
+    start_game_auto_20x16 = partial(start_game_auto, 20, 16, 66)
+    tk.Button(btn_frame, text="20x16", width=25, command=start_game_auto_20x16).grid(
+        row=7, column=0, padx=5, pady=5)
+
+    # ==== Сообщение ====
+    message_frame = tk.Frame(root)
+    tk.Label(message_frame, text="Нет вычисляемых ходов", fg="red", font=("Arial", 12)).pack()
+    tk.Label(message_frame, text="Нажмите 'Ок', чтобы продолжить").pack(pady=5)
+    tk.Button(message_frame, text="Ок", command=resume_solver).pack(pady=5)
+
+    # Скрываем по умолчанию
+    message_frame.pack_forget()
+
+    # ==== Тестовая кнопка для вызова сообщения ====
+    tk.Button(root, text="Показать сообщение", command=lambda: (
+        show_unknown_mine_message(True),
+        print("Решатель остановлен...")
+    )).pack(pady=20)
 
     # Отображение цвета
     global color_label, color_value
